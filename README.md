@@ -1,14 +1,35 @@
 # VENTMASH — каталог промышленных вентиляторов
 
-Учебный MVP B2B-каталога: Python (Flask), CSV → планируется БД, фронтенд на Bootstrap 5, стиль в духе Яндекса.
+Учебный MVP B2B-каталога: Python (Flask), PostgreSQL, фронтенд на Bootstrap 5, стиль в духе Яндекса.
+
+## Требования
+
+- Python 3.10+
+- PostgreSQL (локально или удалённо)
 
 ## Быстрый старт
 
-```bash
-./run.sh
-```
+1. Создать БД и пользователя в PostgreSQL, скопировать пример конфига:
+   ```bash
+   cp .env.example .env
+   ```
+   В `.env` указать:
+   ```
+   DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/ventmash
+   PORT=5000
+   ```
 
-Сервер: http://localhost:5000
+2. Запуск (создаёт таблицы при первом запуске, при пустой БД загружает данные из `fans_data.csv`):
+   ```bash
+   ./run.sh
+   ```
+   Сервер: http://localhost:5000
+
+3. При необходимости загрузить/обновить данные из CSV вручную:
+   ```bash
+   source .venv/bin/activate   # или активировать своё окружение
+   python load_csv.py
+   ```
 
 ## Дальнейшее развитие
 

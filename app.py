@@ -1,11 +1,17 @@
-import csv
-import math
 import os
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any, Optional
 
-from flask import Flask, jsonify, request, send_from_directory
+from dotenv import load_dotenv
+from flask import Flask, g, jsonify, request, send_from_directory
+
+from config import DATABASE_URL, PORT
+from db.connection import close_pool, get_connection, init_pool, put_connection
+from db.init_db import init_db
+from db.load_csv import load_csv_into_db
+from db.repository import count_products, get_by_id, get_by_model_or_slug, list_products
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "fans_data.csv"
@@ -27,140 +33,13 @@ def parse_number_loose(value: Any) -> Optional[float]:
         return None
 
 
-@dataclass
-class Range:
-    min: Optional[float]
-    max: Optional[float]
-    raw: str
-
-
-def parse_range_loose(value: Any) -> Range:
-    raw = normalize_whitespace(value)
-    if not raw:
-        return Range(None, None, "")
-    parts = [normalize_whitespace(p) for p in raw.split("-")]
-    if len(parts) == 1:
-        n = parse_number_loose(parts[0])
-        return Range(n, n, raw)
-    min_v = parse_number_loose(parts[0])
-    max_v = parse_number_loose("-".join(parts[1:]))
-    return Range(min_v, max_v, raw)
-
-
 def slugify(value: str) -> str:
     import re
-
     s = normalize_whitespace(value).lower()
-    # Уберём все, кроме букв/цифр, заменяя на дефис
     s = re.sub(r"[^\w]+", "-", s, flags=re.UNICODE)
     s = re.sub(r"-{2,}", "-", s).strip("-")
     return s
 
-
-def ranges_overlap(a: Range, b: Range) -> bool:
-    a_min = -math.inf if a.min is None else a.min
-    a_max = math.inf if a.max is None else a.max
-    b_min = -math.inf if b.min is None else b.min
-    b_max = math.inf if b.max is None else b.max
-    return a_min <= b_max and b_min <= a_max
-
-
-@dataclass
-class Product:
-    id: str
-    number: str
-    type: str
-    model: str
-    size: str
-    diameter: Optional[float]
-    airflow: Range
-    pressure: Range
-    power: Optional[float]
-    noise_level: Optional[float]
-    price: Optional[float]
-    _raw: Dict[str, str]
-    _meta: Dict[str, Any]
-
-
-class Store:
-    def __init__(self, csv_path: Path):
-        self.csv_path = csv_path
-        self.products: List[Product] = []
-        self.by_id: Dict[str, Product] = {}
-        self.by_model: Dict[str, Product] = {}
-        self.by_model_slug: Dict[str, Product] = {}
-        self.load()
-
-    def load(self) -> None:
-        self.products.clear()
-        self.by_id.clear()
-        self.by_model.clear()
-        self.by_model_slug.clear()
-
-        # Поддерживаем и запятую, и точку с запятой как разделитель.
-        with self.csv_path.open("r", encoding="utf-8") as f:
-            # Пробуем автоматически определить разделитель по первой строке.
-            sample = f.read(1024)
-            f.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-            except csv.Error:
-                # Fallback: предполагаем точку с запятой (как в текущем файле).
-                dialect = csv.excel
-                dialect.delimiter = ";"
-
-            reader = csv.DictReader(f, dialect=dialect)
-
-            for i, row in enumerate(reader, start=1):
-                number = normalize_whitespace(row.get("number")) or str(i)
-                type_ = normalize_whitespace(row.get("type"))
-                model = normalize_whitespace(row.get("model"))
-                size = normalize_whitespace(row.get("size"))
-                diameter = parse_number_loose(row.get("diameter"))
-
-                airflow = parse_range_loose(row.get("efficiency"))
-                pressure = parse_range_loose(row.get("pressure"))
-                power = parse_number_loose(row.get("power"))
-                noise_level = parse_number_loose(row.get("noise_level"))
-                price = parse_number_loose(row.get("price"))
-
-                if not (type_ or model or size):
-                    continue
-
-                p = Product(
-                    id=number,
-                    number=number,
-                    type=type_,
-                    model=model,
-                    size=size,
-                    diameter=diameter,
-                    airflow=airflow,
-                    pressure=pressure,
-                    power=power,
-                    noise_level=noise_level,
-                    price=price,
-                    _raw={
-                        "diameter": normalize_whitespace(row.get("diameter")),
-                        "efficiency": normalize_whitespace(row.get("efficiency")),
-                        "pressure": normalize_whitespace(row.get("pressure")),
-                        "power": normalize_whitespace(row.get("power")),
-                        "noise_level": normalize_whitespace(row.get("noise_level")),
-                        "price": normalize_whitespace(row.get("price")),
-                    },
-                    _meta={
-                        "model_slug": slugify(model),
-                    },
-                )
-
-                self.products.append(p)
-                self.by_id[p.id] = p
-                if p.model:
-                    self.by_model[p.model.lower()] = p
-                if p._meta["model_slug"]:
-                    self.by_model_slug[p._meta["model_slug"]] = p
-
-
-store = Store(CSV_PATH)
 
 app = Flask(
     __name__,
@@ -169,16 +48,21 @@ app = Flask(
 )
 
 
-def product_to_json(p: Product) -> Dict[str, Any]:
-    data = asdict(p)
-    # dataclasses -> JSON-friendly dict, Range уже превратится в словарь
-    return data
+@app.before_request
+def before_request():
+    g.db = get_connection()
+
+
+@app.teardown_request
+def teardown_request(exc=None):
+    if hasattr(g, "db"):
+        put_connection(g.db)
 
 
 @app.get("/api/products")
 def api_products():
-    q = normalize_whitespace(request.args.get("q")).lower()
-    type_ = normalize_whitespace(request.args.get("type"))
+    q = normalize_whitespace(request.args.get("q")).lower() or None
+    type_ = normalize_whitespace(request.args.get("type")) or None
     diameter = parse_number_loose(request.args.get("diameter"))
 
     min_price = parse_number_loose(request.args.get("minPrice"))
@@ -189,7 +73,6 @@ def api_products():
     max_noise = parse_number_loose(request.args.get("maxNoise"))
     min_diameter = parse_number_loose(request.args.get("minDiameter"))
     max_diameter = parse_number_loose(request.args.get("maxDiameter"))
-
     min_airflow = parse_number_loose(request.args.get("minAirflow"))
     max_airflow = parse_number_loose(request.args.get("maxAirflow"))
     min_pressure = parse_number_loose(request.args.get("minPressure"))
@@ -197,99 +80,47 @@ def api_products():
 
     sort = normalize_whitespace(request.args.get("sort")) or "price_asc"
 
-    result = list(store.products)
-
-    if q:
-        result = [
-            p
-            for p in result
-            if q in f"{p.model} {p.size} {p.type}".lower()
-        ]
-
-    if type_:
-        result = [p for p in result if p.type == type_]
-
-    if diameter is not None:
-        result = [p for p in result if p.diameter == diameter]
-
-    if min_price is not None:
-        result = [p for p in result if p.price is not None and p.price >= min_price]
-    if max_price is not None:
-        result = [p for p in result if p.price is not None and p.price <= max_price]
-
-    if min_power is not None:
-        result = [p for p in result if p.power is not None and p.power >= min_power]
-    if max_power is not None:
-        result = [p for p in result if p.power is not None and p.power <= max_power]
-
-    if min_noise is not None:
-        result = [
-            p
-            for p in result
-            if p.noise_level is not None and p.noise_level >= min_noise
-        ]
-    if max_noise is not None:
-        result = [
-            p
-            for p in result
-            if p.noise_level is not None and p.noise_level <= max_noise
-        ]
-
-    if min_diameter is not None:
-        result = [
-            p
-            for p in result
-            if p.diameter is not None and p.diameter >= min_diameter
-        ]
-    if max_diameter is not None:
-        result = [
-            p
-            for p in result
-            if p.diameter is not None and p.diameter <= max_diameter
-        ]
-
-    if min_airflow is not None or max_airflow is not None:
-        b = Range(min_airflow, max_airflow, "")
-        result = [p for p in result if ranges_overlap(p.airflow, b)]
-
-    if min_pressure is not None or max_pressure is not None:
-        b = Range(min_pressure, max_pressure, "")
-        result = [p for p in result if ranges_overlap(p.pressure, b)]
-
-    # Сортировка по цене (asc/desc), элементы без цены всегда в конце.
-    def sort_key(p: Product):
-        no_price = p.price is None
-        base_price = 0.0 if p.price is None else float(p.price)
-        if sort == "price_desc":
-            base_price = -base_price
-        return (1 if no_price else 0, base_price, p.model)
-
-    result.sort(key=sort_key)
-
-    return jsonify([product_to_json(p) for p in result])
+    result = list_products(
+        g.db,
+        q=q,
+        type_=type_,
+        diameter=diameter,
+        min_price=min_price,
+        max_price=max_price,
+        min_power=min_power,
+        max_power=max_power,
+        min_noise=min_noise,
+        max_noise=max_noise,
+        min_diameter=min_diameter,
+        max_diameter=max_diameter,
+        min_airflow=min_airflow,
+        max_airflow=max_airflow,
+        min_pressure=min_pressure,
+        max_pressure=max_pressure,
+        sort=sort,
+    )
+    return jsonify(result)
 
 
 @app.get("/api/products/<id_or_model>")
 def api_product_detail(id_or_model: str):
     raw = normalize_whitespace(id_or_model)
-    key = raw.lower()
-
-    p = store.by_id.get(raw) or store.by_model.get(key) or store.by_model_slug.get(
-        slugify(raw)
+    p = get_by_id(g.db, raw) or get_by_model_or_slug(
+        g.db, raw.lower(), slugify(raw)
     )
     if not p:
         return jsonify({"error": "Product not found"}), 404
-    return jsonify(product_to_json(p))
+    return jsonify(p)
 
 
 @app.get("/api/health")
 def api_health():
-    return jsonify({"ok": True, "products": len(store.products)})
+    n = count_products(g.db)
+    return jsonify({"ok": True, "products": n})
 
 
 @app.get("/")
 def index_page():
-    # Отдаём готовый index.html из public
     return send_from_directory(app.static_folder, "index.html")
 
 
@@ -309,6 +140,16 @@ def script_js():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "3000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    init_pool(DATABASE_URL)
+    conn = get_connection()
+    try:
+        init_db(conn)
+        if count_products(conn) == 0 and CSV_PATH.exists():
+            load_csv_into_db(conn, CSV_PATH)
+    finally:
+        put_connection(conn)
 
+    try:
+        app.run(host="0.0.0.0", port=PORT, debug=True)
+    finally:
+        close_pool()
